@@ -20,7 +20,7 @@ from megatron.core.pipeline_parallel.deepspeed_zbh1_engine import _exec_backward
 from megatron.core.pipeline_parallel.deepspeed_zbh1_schedule import BackwardOnlyPass, WeightPass, ZeroBubbleH1Pipeline
 from megatron.arguments import (parse_args, validate_args)
 from megatron.checkpointing import load_args_from_checkpoint
-from megatron.global_vars import set_global_variables
+from megatron.global_vars import set_global_variables, unset_global_variables
 from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
 from megatron.utils import is_rank_0
@@ -49,6 +49,8 @@ def initialize_megatron(args=None, extra_args_provider=None, args_defaults={},
     if not args:
         args = parse_args(extra_args_provider, ignore_unknown_args)
 
+    print(f"AT INIT MEGATRON, args is {args}")
+
     for key in external_args:
         if key in args:
             setattr(args, key, external_args[key])
@@ -71,7 +73,6 @@ def initialize_megatron(args=None, extra_args_provider=None, args_defaults={},
         _initialize_distributed()
 
         # Random seeds for reproducibility.
-        # TODO: uncomment!
         if args.rank == 0:
              print('> setting random seeds to {} ...'.format(args.seed))
         _set_random_seed(args.seed, args.data_parallel_random_init)
@@ -103,6 +104,10 @@ def initialize_megatron(args=None, extra_args_provider=None, args_defaults={},
         # No continuation function
         return None
 
+
+def destroy_megatron(args=None):
+    _destroy_distributed()
+    unset_global_variables()
 
 def _compile_dependencies():
 
@@ -153,11 +158,11 @@ def _compile_dependencies():
         start_time = time.time()
         print('> compiling and loading fused kernels ...', flush=True)
         if get_accelerator().device_count() > 0: # Skip when CPU-only
-            fused_kernels.load(args)
+            fused_kernels.load()
         torch.distributed.barrier()
     else:
         torch.distributed.barrier()
-        fused_kernels.load(args)
+        fused_kernels.load()
     # Simple barrier to make sure all ranks have passed the
     # compilation phase successfully before moving on to the
     # rest of the program. We think this might ensure that
@@ -196,6 +201,13 @@ def setup_deepspeed_random_and_activation_checkpointing(args):
         synchronize=args.synchronize_each_layer,
         profile=args.profile_backward)
 
+def _destroy_distributed():
+    """Destroy distributed groups"""
+    args = get_args()
+    if args.deepspeed:
+        deepspeed.destroy_distributed()
+    mpu.destroy_model_parallel()
+
 
 def _initialize_distributed():
     """Initialize torch.distributed and core model parallel."""
@@ -209,7 +221,7 @@ def _initialize_distributed():
         args.world_size = torch.distributed.get_world_size()
     else:
         if args.rank == 0:
-            print('> initializing torch distributed ...', flush=True)
+            print(f'> initializing torch distributed, ip is {args.master_ip}, port is {args.master_port}', flush=True)
         # Manually set the device ids.
         os.environ['RANK'] = str(args.rank)
         os.environ['WORLD_SIZE'] = str(args.world_size)
@@ -238,7 +250,7 @@ def _initialize_distributed():
         )
     # Call the init process
     if args.deepspeed or args.ds_inference:
-        deepspeed.init_distributed()
+        deepspeed.init_distributed(timeout=timedelta(minutes=args.distributed_timeout_minutes))
     else:
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
@@ -262,12 +274,14 @@ def _initialize_distributed():
             if args.distributed_config_file:
                 mpu.initialize_model_parallel_from_file(
                     args.pipeline_model_parallel_size,
-                    args.distributed_config_file
+                    args.distributed_config_file,
+                    args.distributed_timeout_minutes
                 )
             else:
                 mpu.initialize_model_parallel(args.tensor_model_parallel_size,
                                             args.pipeline_model_parallel_size,
                                             args.ds_sequence_parallel_size,
+                                            args.distributed_timeout_minutes,
                                             args.virtual_pipeline_model_parallel_size,
                                             args.pipeline_model_parallel_split_rank,
                                             use_distributed_optimizer=args.use_distributed_optimizer)

@@ -2,6 +2,7 @@
 
 """Pretrain GPT"""
 
+from torch.multiprocessing import set_start_method
 import torch
 import math
 from functools import partial
@@ -12,7 +13,7 @@ from megatron import get_tokenizer
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel, GPTModelPipe, LlamaModelPipe, OPTModelPipe, GPTNeoModelPipe
+from megatron.model import GPTModelPipe, LlamaModelPipe, OPTModelPipe, GPTNeoModelPipe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group, update_rotary_pos_emb
@@ -22,6 +23,8 @@ from megatron.arguments import parse_args
 import deepspeed
 from deepspeed.runtime.utils import see_memory_usage
 from deepspeed.accelerator.real_accelerator import get_accelerator
+import torch.multiprocessing as mp
+
 import os
 import subprocess
 import time
@@ -50,13 +53,7 @@ def model_provider(pre_process=True, post_process=True, use_embedding=True, use_
                              enabled=args.zero_stage == 3,
                              mpu=mpu):
         if args.deepspeed and not args.no_pipeline_parallel:
-            if args.model_name == "GPT":
-                model = GPTModelPipe(
-                    config=config,
-                    num_tokentypes=0,
-                    parallel_output=True
-                )
-            elif args.model_name == "OPT":
+            if args.model_name == "OPT":
                 model = OPTModelPipe(
                     config=config,
                     num_tokentypes=0,
@@ -76,6 +73,15 @@ def model_provider(pre_process=True, post_process=True, use_embedding=True, use_
                 )
             elif args.model_name == "GPT-Neo":
                 model = GPTNeoModelPipe(
+                    config=config,
+                    num_tokentypes=0,
+                    parallel_output=True,
+                    use_embedding=use_embedding,
+                    use_transformer=use_transformer,
+                    use_last=use_last
+                )
+            elif args.model_name == "GPT2":
+                model = GPTModelPipe(
                     config=config,
                     num_tokentypes=0,
                     parallel_output=True,
@@ -382,15 +388,19 @@ def git_ds_info():
     print(f'**** Git info for Megatron: git_hash={git_hash} git_branch={git_branch} ****')
 
 
-def run_megatron(all_args):
+def run_megatron(all_args, cleanup_event=None, restart_event=None, arg_dict=None):
     git_ds_info()
+    set_start_method("spawn", force=True)
     pretrain(train_valid_test_datasets_provider,
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
              data_post_process=data_post_process,
-             all_args=all_args)
+             all_args=all_args,
+             cleanup_event=cleanup_event,
+             restart_event=restart_event,
+             arg_dict=arg_dict)
 
 if __name__ == "__main__":
     # Parse arguments

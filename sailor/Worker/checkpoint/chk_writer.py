@@ -11,54 +11,42 @@ from ctypes import *
 import numpy as np
 
 from sailor.Worker.worker_utils import debug_print
+from concurrent.futures import ThreadPoolExecutor, wait
+
 
 class ChkWriter:
 
-    def __init__(self, save_dir, pp_rank, tp_rank, pccheck_threads):
+    def __init__(self, save_dir, start_layer, rank, tp_rank):
 
         self.cpu_buffer = None
-        self.total_size = 0
         self.model = None
-        self.opt = None
+        self.optimizer = None
         self.save_dir = save_dir
-        self.pp_rank = pp_rank
         self.tp_rank = tp_rank
-
-        self.ckp_path = f"{self.save_dir}/checkpoint_PP{self.pp_rank}_TP{self.tp_rank}.pt"
-        self.pccheck_writer = None
-        self.pccheck_threads = pccheck_threads
+        self.rank = rank
+        self.start_layer = start_layer
+        self.index = 0
 
     def init_buffer(self):
         # TODO: fix for fp16
-        lib_path = "/root/sailor/sailor/Worker/checkpoint/libtest_pccheck.so"
-        self.lib = cdll.LoadLibrary(lib_path.encode())
-        self.pccheck_writer = self.lib.writer(self.ckp_path.encode())
-
-        self.lib.savenvm_new.argtypes = [
-            c_void_p,
-            c_void_p,
-            c_size_t,
-            c_int,
-            c_int
-        ]
-
         sz = 0
-        for k, v in self.model.items():
-            if torch.is_tensor(v):
-                sz += torch.numel(v)
-        print(f"model_size is {sz}")
-
-        # TODO: fix params
-        for it, val in self.optimizer['state'].items():
-            for k, v in val.items():
-                if torch.is_tensor(v):
-                    sz += torch.numel(v)
-
-        self.total_size = sz
-        debug_print(f"Checkpoint size is {sz} floats")
+        for i,module in enumerate(self.model):
+            if not hasattr(module, 'state_dict'):
+                 continue
+            if hasattr(module, 'parameters'):
+                 for k, v in module.state_dict().items():
+                     if torch.is_tensor(v):
+                         sz += torch.numel(v)
+                 for name, p in module.named_parameters():
+                     if not ('weight' in name or 'bias' in name):
+                         continue
+                     for _, val in self.optimizer.state[p].items():
+                         sz += torch.numel(val)
         self.cpu_buffer=torch.empty(sz, dtype=torch.float32, pin_memory=True, device="cpu")
+        self.copy_stream = torch.cuda.Stream()
+        self.executor = ThreadPoolExecutor(max_workers=1)
 
-    def save_async(
+    def save_async_torch(
         self,
         model,
         optimizer,
@@ -67,17 +55,18 @@ class ChkWriter:
         initial_set,
         cp_in_progress,
         start,
+        stop,
         barrier
     ):
+        # simple, torch-based, unoptimized implementation
         print(f"************ Async proc started")
 
         # wait to be initialized
         while True:
             with lock:
-                if initial_set.value==1:
+                if initial_set.is_set():
                     break
 
-        print(f"************ About to initialize buffers")
         self.model = model
         self.optimizer = optimizer
         self.res_state = res_state
@@ -88,60 +77,53 @@ class ChkWriter:
         print(f"************ About to enter checkp-train loop")
         # checkp-train loop
         while True:
-            with lock:
-                if start.value == 0:
-                    continue
 
-            # 1. snapshot
-            self.copy_to_cpu()
+            start.wait()
+            if stop.is_set():
+                break
 
-            with lock:
-                cp_in_progress.value = 0
-
-            # 2. persist
-            save_path = f"{self.save_dir}/checkpoint_PP{self.pp_rank}_TP{self.tp_rank}_STEP{self.res_state['global_steps']}.pt"
-            self.persist(save_path) # TODO: fix path
+            self.save_torch(self.res_state['global_steps'])
 
             with lock:
-                start.value = 0
+                cp_in_progress.clear()
+                start.clear()
 
-    def copy_to_cpu(self):
-        start_idx = 0
-        #print(f"FROM CHECKPOINT - optimizer is {self.optimizer['state'][193]['exp_avg']}")
+        # exit
+        self.executor.shutdown()
 
-        torch.cuda.synchronize()
-        gpu_start = time.time()
+    def save_numpy(self, start, end, key):
+        self.cpu_buffer[start:end].detach().numpy().tofile(f"{self.save_dir}/module_{key}_{self.tp_rank}_index_{self.index}")
 
-        for k, v in self.model.items():
-            if torch.is_tensor(v):
-                v_numel = torch.numel(v)
-                self.cpu_buffer[start_idx:start_idx+v_numel].copy_(torch.flatten(v))
-                start_idx += v_numel
-
-        for it, val in self.optimizer['state'].items():
-            for k, v in val.items():
-                if torch.is_tensor(v):
-                    v_numel = torch.numel(v)
-                    self.cpu_buffer[start_idx:start_idx+v_numel].copy_(torch.flatten(v))
-                    start_idx += v_numel
-
-        torch.cuda.synchronize()
-        gpu_end = time.time()
-        print(f"Copying took {gpu_end-gpu_start}")
-
-    def persist(self, path):
-        persist_start = time.time()
-
-        # write model + optimizer
-        piter = self.res_state['global_steps'] % 2
-        cpu_arr = np.ctypeslib.as_array(self.cpu_buffer, shape=(self.total_size,))
-        cpu_arr_ct = np.ctypeslib.as_ctypes(cpu_arr)
-        self.lib.savenvm_new(self.pccheck_writer, cpu_arr_ct, self.total_size, self.pccheck_threads, piter)
-        persist_end = time.time()
-
-        # write metadata
-        checkpoint = {
-            'res_state': self.res_state
-        }
-        torch.save(checkpoint, path)
-        print(f"***************** Checkpoint persisted to {path}, Persist took {persist_end-persist_start} sec")
+    def save_torch(self, iteration):
+        print(f"SAVE, Iteration is {iteration}, TP RANK is {self.tp_rank}")
+        idx = 0
+        futures = []
+        if True: #with ThreadPoolExecutor(max_workers=4) as executor:
+            for i,module in enumerate(self.model):
+              prev_idx = idx
+              key = i+self.start_layer
+              if not hasattr(module, 'state_dict'):
+                  continue
+              if hasattr(module, 'parameters'):
+                   for _, value in module.state_dict().items():
+                        if torch.is_tensor(value):
+                            sz = torch.numel(value)
+                            self.cpu_buffer[idx:idx+sz].copy_(value.flatten())
+                            idx+=sz
+                   for name, p in module.named_parameters():
+                       if not ('weight' in name or 'bias' in name):
+                            continue
+                       for opt_key, val in self.optimizer.state[p].items():
+                            sz = torch.numel(val)
+                            with torch.cuda.stream(self.copy_stream):
+                                self.cpu_buffer[idx:idx+sz].copy_(val.flatten()) # many small transfers, could be optimized by batching them
+                            idx+=sz
+                   torch.cuda.synchronize()
+                   futures.append(self.executor.submit(self.save_numpy, prev_idx, idx, key))
+        #torch.distributed.barrier() # NOTE: this might be quite slow
+        wait(futures)
+        self.index = 1-self.index
+        if self.rank==0:
+            deepspeed_state = self.res_state.copy()
+            deepspeed_state["index"] = self.index
+            torch.save(deepspeed_state, f"{self.save_dir}/check_{iteration}")

@@ -21,7 +21,6 @@
 #include <fcntl.h> /* Definition of AT_* constants */
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <libpmem.h>
 #include <sys/stat.h>
 #include <thread>
 #include <atomic>

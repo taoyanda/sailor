@@ -222,6 +222,7 @@ class DeepSpeedEngine(Module):
                  dont_change_device=False):
 
         super(DeepSpeedEngine, self).__init__()
+
         self.dont_change_device = dont_change_device
         self.client_optimizer = optimizer
         self.client_lr_scheduler = lr_scheduler
@@ -1162,7 +1163,10 @@ class DeepSpeedEngine(Module):
                 if torch.is_tensor(p) and is_replicated(p):
                     # Broadcast the model for different parameters
                     param_name_key = ".".join(x for x in n.split(".")[1:]) # param name is layer.name
-                    dim_param = params_tp_dim_dict[param_name_key]
+                    if param_name_key not in params_tp_dim_dict:
+                        dim_param = -1
+                    else:
+                        dim_param = params_tp_dim_dict[param_name_key]
                     if dim_param==-1:
                         dist.broadcast(p.data, bc_src, group=dp_group)
                     elif dim_param==0:
@@ -1969,6 +1973,7 @@ class DeepSpeedEngine(Module):
             inputs = self._cast_inputs_half(inputs)
 
         loss = self.module(*inputs, **kwargs)
+        return loss
 
         if self.zero_optimization_partition_weights():
             # Disable automated discovery of external parameters
@@ -2615,8 +2620,10 @@ class DeepSpeedEngine(Module):
             non_expert_grads_group = []
             max_tp = max(self.dp_groups_tps[idx])
             for param_name, whole_grad in non_expert_grads_dict.items():
-                param_name_key = ".".join(x for x in param_name.split(".")[1:]) # param name is layer.name
-                dim_param = params_tp_dim_dict[param_name_key]
+                if param_name not in params_tp_dim_dict:
+                    dim_param = -1
+                else:
+                    dim_param = params_tp_dim_dict[param_name]
                 if dim_param==-1:
                     non_expert_grads_group.append(whole_grad)
                 elif dim_param==0:

@@ -104,7 +104,24 @@ def set_global_variables(args):
 
     if args.exit_signal_handler:
         _set_signal_handler()
-    
+
+
+def unset_global_variables():
+    global _GLOBAL_ARGS
+    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+    global _GLOBAL_TOKENIZER
+    global _GLOBAL_TENSORBOARD_WRITER
+    global _GLOBAL_ADLR_AUTORESUME
+    global _GLOBAL_TIMERS
+
+    _GLOBAL_ARGS = None
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
+    _GLOBAL_TOKENIZER = None
+    _GLOBAL_TENSORBOARD_WRITER = None
+    _GLOBAL_ADLR_AUTORESUME = None
+    _GLOBAL_TIMERS = None
+
+    # TODO: anything else here?
 
 def set_args(args):
     global _GLOBAL_ARGS

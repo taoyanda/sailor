@@ -116,8 +116,7 @@ void SailorPlanner::build_structs()
 
     for (int tp : {1, 2, 4})
     {
-        if ((training_info->model).layer_params[tp][0] == 0.0)
-            continue;
+
         for (auto stages : all_stages)
         {
             for (auto stage : stages)
@@ -206,17 +205,12 @@ void SailorPlanner::build_structs()
                 {
                     auto stage = stages[stage_idx];
                     auto pp_key = tuple<int, int, int>(pp, stage[0], stage.size());
-                    auto key = make_pair(stage[0], stage.size());
+                    // cout << gpu_type << "," << pp << "," << mbs << "," << stage_idx << endl;
                     int min_tp = -1;
                     for (auto tp : possible_tmps_per_gpu[idx])
                     {
-                        if (params_all_stages[tp].find(key) == params_all_stages[tp].end())
-                            continue;
-
-                        //cout << gpu_type << "," << tp << "," << pp << "," << mbs << "," << stage_idx << endl;
                         if (check_stage_fits(stages, params_all_stages[tp], activation_per_stage[tp], stage_idx, mbs, tp, gpu_type, float_size))
                         {
-                            //printf("FITS!\n");
                             min_tp = tp;
                             break;
                         }
@@ -913,6 +907,8 @@ void SailorPlanner::get_plans_no_heuristics(unordered_map<string, vector<pair<st
                     debug_print(tmp_degrees[id]);
                 }
 
+                printf("HERE!\n");
+
                 // do regular search for that combo
                 vector<pair<string, vector<string>>> region_list = get_regions_list(
                     given_resources,
@@ -1392,6 +1388,71 @@ vector<struct Config> SailorPlanner::get_sorted_plans(unordered_map<string, unor
     auto duration = duration_cast<microseconds>(stop - start);
     cout << "--------------- get_plans_num_gpus_dp took " << duration.count() << " us" << endl;
     cout << "--------------- dp_solve_total is " << dp_solve_total << " us" << endl;
+
+    vector<struct Config> new_configs = {};
+    for (auto config : all_configs)
+    {
+        if (objective_str == "throughput")
+        {
+            if (max_budget > 0.0 && (config.cost > max_budget))
+                continue;
+        }
+        else
+        {
+            if ((max_iter_time > 0) && (config.Tpp > max_iter_time))
+                continue;
+        }
+
+        auto config_zones = config.get_zones();
+        // check validity
+        unordered_map<string, unordered_map<string, int>> used_gpus;
+        auto configs_per_stage = config.get_config_per_stage();
+        for (auto stage_config : configs_per_stage)
+        {
+            for (auto tp_config : stage_config)
+            {
+                auto gpu_type = available_gpu_types[get<0>(tp_config)];
+                auto zone = config_zones[get<2>(tp_config)];
+                if (used_gpus.find(zone) == used_gpus.end())
+                {
+                    used_gpus[zone] = {};
+                }
+                if (used_gpus[zone].find(gpu_type) == used_gpus[zone].end())
+                {
+                    used_gpus[zone][gpu_type] = 0;
+                }
+                used_gpus[zone][gpu_type] += get<1>(tp_config);
+            }
+        }
+
+        bool invalid = false;
+        for (auto zone_info : used_gpus)
+        {
+            auto zone = zone_info.first;
+            if (max_num_gpus.find(zone) == max_num_gpus.end())
+            {
+                invalid = true;
+                break;
+            }
+            for (auto gpu_info : used_gpus[zone])
+            {
+                auto gpu = gpu_info.first;
+                if (
+                    (max_num_gpus[zone].find(gpu) == max_num_gpus[zone].end()) ||
+                    (used_gpus[zone][gpu] > max_num_gpus[zone][gpu])
+                )
+                {
+                    invalid = true;
+                    break;
+                }
+            }
+        }
+
+        if (invalid)
+            continue;
+
+        new_configs.push_back(config);
+    }
 
     if (objective_str == "throughput")
     {

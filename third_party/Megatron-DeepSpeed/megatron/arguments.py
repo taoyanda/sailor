@@ -127,6 +127,7 @@ def validate_args(args, defaults={}):
                     args.pipeline_model_parallel_size, 'split rank needs'\
                     ' to be less than pipeline model parallel size ({})'.format(
                             args.pipeline_model_parallel_size)
+    print(args.tokenizer_type)
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -152,6 +153,8 @@ def validate_args(args, defaults={}):
         args.recompute_granularity = 'selective'
     del args.recompute_activations
 
+    print(args.tokenizer_type)
+
     # Set input defaults.
     for key in defaults:
         # For default to be valid, it should not be provided in the
@@ -165,6 +168,7 @@ def validate_args(args, defaults={}):
                                                flush=True)
         else:
             setattr(args, key, defaults[key])
+    print(args.tokenizer_type)
 
     # Batch size.
     assert args.micro_batch_size is not None

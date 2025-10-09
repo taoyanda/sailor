@@ -282,7 +282,11 @@ class PipelineEngine(DeepSpeedEngine):
 
         self.dynamic_shape = self.module.dynamic_shape
         self.galvatron_profiler = None
+        self.chk_manager = None
 
+    def destroy(self):
+        super().destroy()
+        self._exec_instr = None
 
     def set_has_attention_mask(self, value):
         assert isinstance(value, bool)
@@ -1224,6 +1228,12 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers(PIPE_RECV_GRAD_TIMER).stop()
 
     def _exec_optimizer_step(self, lr_kwargs=None):
+
+        if self.chk_manager is not None:
+            print(f"Wait for CPU copy ....")
+            while self.chk_manager.gpu_copy_in_progress():
+                continue
+
         self.timers(STEP_MICRO_TIMER).start()
         if self.wall_clock_breakdown():
             #self.timers(STEP_MICRO_TIMER).start()

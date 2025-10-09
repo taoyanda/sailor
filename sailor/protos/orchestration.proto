@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+service MasterController {
+  rpc Heartbeat (ClusterTopology) returns (HeartbeatResponse) {}
+}
+
+service ClusterController {
+    rpc TopologyChange(TopologyChangeRequest) returns (TopologyChangeResponse) {}
+}
+
+service WorkerAgent {
+  rpc ConfigurationChange(WorkerConfigurationRequest) returns (WorkerConfigurationResponse) {}
+  rpc CheckReady(CheckReadyRequest) returns (CheckReadyResponse) {}
+  rpc Kill(KillRequest) returns (KillResponse) {}
+  rpc CheckHealth(CheckHealthRequest) returns (CheckHealthResponse) {}
+}
+
+message TopologyChangeRequest {
+    Topology topology = 1;
+    HyperParams hparams = 2;
+}
+
+message Topology {
+    repeated Node worker_nodes = 1;
+    string master_ip = 2;
+    string master_port = 3;
+    int32 world_size = 4;
+}
+
+message TopologyChangeResponse {
+}
+
+message Node {
+    string ip_addr = 1;
+    string port = 2;
+    string name = 3;
+    int32 rank = 4;
+    string namespace = 5;
+    string cluster_id = 6;
+    string gname = 7;
+}
+
+message ClusterTopology {
+  string cluster_id = 1;
+  string cluster_controller_ip = 2;
+  string cluster_controller_port = 3;
+  repeated Node worker_nodes = 4;
+}
+
+message HeartbeatResponse {
+}
+
+message WorkerConfigurationRequest {
+  WorkerConfiguration configuration = 1;
+  HyperParams hyper_params = 2;
+  RemoteCkpt remote_ckpt = 3;
+}
+
+message ReplicaConfig {
+  repeated int32 replica_ranks = 1;
+}
+
+message StageConfig {
+  repeated ReplicaConfig stage_replicas = 1;
+}
+
+message WorkerConfigurationResponse {
+}
+
+message WorkerConfiguration {
+    repeated int32 ranks = 1;
+    int32 world_size = 2;
+    string master_ip = 3;
+    string master_port = 4;
+    int32 fail = 5;
+    int32 bcast_rank = 6;
+    string gname = 7;
+    int32 pipeline_parallelism = 8;
+    int32 tensor_parallelism = 9;
+    int32 data_parallelism = 10;
+    int32 max_tensor_parallelism = 11;
+    repeated StageConfig all_stages = 12;
+    repeated int32 layers_per_stage = 13;
+}
+
+message HyperParams {
+  int32 num_batch = 1;
+  int32 rem_batch = 2;
+  int32 global_batch_size = 3;
+  int32 micro_batch_size = 4;
+  int32 num_stages = 5;
+  bool cocktail_sgd = 6;
+  OptParams opt_params = 7;
+  bool ckpt_cpu = 8;
+  int32 ga_steps = 9;
+}
+
+message OptParams {
+  double lr = 1;
+  double momentum = 2;
+  double wd = 3;
+}
+
+message RemoteCkpt {
+  string master_ip = 1;
+  string master_port = 2;
+  string world_size = 3;
+  string rank = 4;
+  string group_id = 5;
+  string num_ckpt_groups = 6;
+  string ondem_master_ip = 7;
+  string ondem_master_port = 8;
+
+}
+
+message CheckReadyRequest {
+  int32 is_ready=1;
+}
+
+message CheckReadyResponse {
+}
+
+message KillRequest {
+  bool exit = 1;
+}
+
+message KillResponse {
+}
+
+message CheckHealthRequest {
+}
+
+message CheckHealthResponse {
+  bool processes_ok = 1;
+}

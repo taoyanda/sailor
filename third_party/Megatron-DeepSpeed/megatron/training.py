@@ -16,6 +16,8 @@ from collections import OrderedDict
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 import os
 from pathlib import Path
+import re
+import copy
 
 from megatron import get_args
 from megatron import get_signal_handler
@@ -31,10 +33,9 @@ from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint, get_additional_state
 from megatron.model import Float16Module
-from megatron.model import GPTModel
 from megatron.core.enums import ModelType
 from megatron.optimizer import get_megatron_optimizer
-from megatron.initialize import initialize_megatron
+from megatron.initialize import initialize_megatron, destroy_megatron
 from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
@@ -53,7 +54,7 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.compression.compress import init_compression, redundancy_clean
 from deepspeed.runtime.data_pipeline.data_routing.helper import convert_to_random_ltd
 from megatron.model.transformer import ParallelTransformerLayer
-from megatron.model import LlamaModelPipe
+from megatron.model import LlamaModelPipe, GPTModelPipe
 from deepspeed.utils.timer import STEP_MICRO_TIMER
 
 from deepspeed import comm as dist
@@ -96,12 +97,95 @@ def _create_ds_config_dict():
 
     return ds_config_dict
 
+# called every time a restart happens
+def restart(
+    all_args,
+    model_provider,
+    model_type,
+    train_valid_test_dataset_provider,
+    extra_args_provider=None,
+    args_defaults={},
+    data_post_process=None,
+    external_args={}
+):
+    initialize_megatron(
+        args = all_args,
+        extra_args_provider=extra_args_provider,
+        args_defaults=args_defaults,
+        external_args=external_args
+    )
+
+    args = get_args()
+
+    if args.deepspeed:
+        args.deepspeed_config_dict = _create_ds_config_dict()
+        if "curriculum_learning" in args.deepspeed_config_dict and \
+            "enabled" in args.deepspeed_config_dict["curriculum_learning"]:
+            args.curriculum_learning_legacy = args.deepspeed_config_dict[ \
+                "curriculum_learning"]["enabled"]
+        if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
+            from deepspeed.runtime.data_pipeline.curriculum_scheduler \
+                import CurriculumScheduler
+            args.curriculum_scheduler = CurriculumScheduler( \
+                args.deepspeed_config_dict["curriculum_learning"])
+        if "compression_training" in args.deepspeed_config_dict:
+            args.compression_training = True
+
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+        model_provider, model_type, teacher=False, data_post_process=data_post_process,
+        build_train_valid_test_datasets_provider=train_valid_test_dataset_provider)
+
+    if args.rank == 0:
+        if args.save and not os.path.exists(args.save):
+            os.makedirs(args.save)
+
+    if args.save:
+        chk_manager = Chk_manager(
+            args.save,
+            model[0].module.parts[model[0].stage_id],
+            args.rank,
+            mpu.get_pipeline_model_parallel_rank(),
+            mpu.get_tensor_model_parallel_rank(),
+        )
+        assert args.deepspeed, "checkpointing only supported with deepspeed"
+    else:
+        chk_manager = None
+
+    if args.load:
+        start_iter = load_simple(model[0].module.parts[model[0].stage_id], model, optimizer)
+    else:
+        start_iter = 0
+
+    if args.virtual_pipeline_model_parallel_size is not None:
+        all_data_iterators = [
+            build_train_valid_test_data_iterators(
+                train_valid_test_dataset_provider)
+            for _ in range(len(model))
+        ]
+        train_data_iterator = [data_iterators[0]
+                               for data_iterators in all_data_iterators]
+        valid_data_iterator = [data_iterators[1]
+                               for data_iterators in all_data_iterators]
+        test_data_iterator = [data_iterators[2]
+                              for data_iterators in all_data_iterators]
+    else:
+        train_data_iterator, valid_data_iterator, test_data_iterator \
+            = build_train_valid_test_data_iterators(
+                train_valid_test_dataset_provider)
+
+
+    return model, optimizer, opt_param_scheduler, chk_manager, start_iter, \
+        train_data_iterator, valid_data_iterator, test_data_iterator
+
 
 def pretrain(train_valid_test_dataset_provider,
              model_provider,
              model_type,
              forward_step_func,
              all_args=None,
+             cleanup_event=None,
+             restart_event=None,
+             arg_dict=None,
              process_non_loss_data_func=None,
              extra_args_provider=None,
              args_defaults={},
@@ -137,16 +221,23 @@ def pretrain(train_valid_test_dataset_provider,
             to set already parse arguments.
     """
 
+    if cleanup_event:
+        # for NCCL error handling - only if run with controller/agent support
+        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "2"
+        os.environ["TORCH_NCCL_ENABLE_MONITORING"] = "1"
+        os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "70"
+        os.environ["TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC"] = "1000"
 
+    reconf_start_time = time.time()
     # Initalize and get arguments, timers, and Tensorboard writer.
 
+    all_args_copy = copy.deepcopy(all_args)
     initialize_megatron(
         args = all_args,
         extra_args_provider=extra_args_provider,
         args_defaults=args_defaults,
         external_args=external_args
     )
-
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     if get_accelerator().device_name() == 'cuda':
@@ -185,34 +276,52 @@ def pretrain(train_valid_test_dataset_provider,
 
     rank = torch.distributed.get_rank()
 
+    torch.cuda.synchronize()
+    print(f"[RECONFIGURATION] Megatron + Distributed Init time took {time.time()-reconf_start_time} sec")
+    reconf_start_model_time = time.time()
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, teacher=False, data_post_process=data_post_process,
         build_train_valid_test_datasets_provider=train_valid_test_dataset_provider)
 
-    if mpu.get_tensor_model_parallel_rank() == 0:
+    if args.rank == 0:
         if args.save and not os.path.exists(args.save):
             os.makedirs(args.save)
 
     if args.save:
         chk_manager = Chk_manager(
             args.save,
+            model[0].module.parts[model[0].stage_id],
+            args.rank,
             mpu.get_pipeline_model_parallel_rank(),
             mpu.get_tensor_model_parallel_rank(),
-            args.pccheck_threads
         )
+        assert args.deepspeed, "checkpointing only supported with deepspeed"
     else:
         chk_manager = None
 
     if args.sailor_profile:
-    	hook_params.set_params('1', 'loss_fn')
-    	add_hooks(model[0].module, take_time_fwd_pre, take_time_and_mem_fwd, take_time_bwd_pre, take_time_bwd)
+        if isinstance(model[0].module, GPTModelPipe):
+    	    hook_params.set_params('tied_modules', 'loss_fn')
+        else:
+    	    hook_params.set_params('1', 'loss_fn')
+        add_hooks(model[0].module, take_time_fwd_pre, take_time_and_mem_fwd, take_time_bwd_pre, take_time_bwd)
 
     timers('model-and-optimizer-setup').stop()
     print('after model, optimizer, and learning rate '
                    'scheduler are built', flush=True)
 
+    if args.load:
+        start_iter = load_simple(model[0].module.parts[model[0].stage_id], model, optimizer)
+    else:
+        start_iter = 0
+
+    torch.cuda.synchronize()
+    print(f"[RECONFIGURATION] Model reloading took {time.time()-reconf_start_model_time} sec")
+
+    reconf_start_data_time = time.time()
     # Data stuff.
     timers('train/valid/test-data-iterators-setup', log_level=0).start(
         barrier=True)
@@ -233,18 +342,7 @@ def pretrain(train_valid_test_dataset_provider,
             = build_train_valid_test_data_iterators(
                 train_valid_test_dataset_provider)
 
-    # if args.data_efficiency_curriculum_learning:
-    #     if args.deepspeed_dataloader is not None:
-    #         # We use args to pass the deepspeed_dataloader because adding
-    #         # output to setup_model_and_optimizer will break the API for other
-    #         # cases. We clear args.deepspeed_dataloader after updating
-    #         # train_data_iterator because args will be saved in checkpoint and
-    #         # attempting to save the whole deepspeed_dataloader will lead to
-    #         # "AttributeError: Can't pickle local object...".
-    #         train_data_iterator = iter(args.deepspeed_dataloader)
-    #         args.deepspeed_dataloader = None
-    #     else:
-    #         train_data_iterator = None
+
     timers('train/valid/test-data-iterators-setup').stop()
     print('after dataloaders are built', flush=True)
 
@@ -261,6 +359,8 @@ def pretrain(train_valid_test_dataset_provider,
     # timers.log(['model-and-optimizer-setup',
     #             'train/valid/test-data-iterators-setup'], barrier=True)
     print('after timers.log ...', flush=True)
+
+    ####### for profiling
 
     tmp_world_size = mpu.get_tensor_model_parallel_world_size()
     pp_world_size = mpu.get_pipeline_model_parallel_world_size()
@@ -361,146 +461,238 @@ def pretrain(train_valid_test_dataset_provider,
             with open(res_file, 'w') as f:
                 json.dump(profile, f, indent=2)
 
-    if not args.skip_train and not args.oobleck_profile and not args.varuna_profile:
-        print_rank_0('training ...')
+    torch.cuda.synchronize()
+    total_reconf_time = time.time()-reconf_start_time
 
-        if args.dataloader_type == 'cyclic' and args.retro_add_retriever:
-            args.train_iters = args.retro_cyclic_train_iters
-            print_rank_0("retro cyclic train iters : %d" % args.train_iters)
+    print(f"[RECONFIGURATION] Data setup took {time.time()-reconf_start_data_time} sec")
 
-        iteration = 0
-        if args.do_train and args.train_iters > 0:
-            iteration = train(forward_step_func,
-                            model, optimizer, opt_param_scheduler,
-                            train_data_iterator, valid_data_iterator,
-                            process_non_loss_data_func, chk_manager, galvatron_profiler)
+    print(f"[RECONFIGURATION] Total reconf time took {total_reconf_time} sec")
 
-        #print_datetime('after training is done')
-        # Clean the model
-        if args.compression_training:
-            model = [redundancy_clean(model[0], args.deepspeed_config_dict, mpu)]
+    # in a while loop for restarts
+    exception = False
+    while True:
 
-        if args.save and iteration != 0:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
-    else:
-        print_rank_0('skipping training (--skip-train is on) ...')
+        if not args.skip_train and not args.oobleck_profile and not args.varuna_profile:
+            print_rank_0('training ...')
 
-        iteration = args.iteration
+            if args.dataloader_type == 'cyclic' and args.retro_add_retriever:
+                args.train_iters = args.retro_cyclic_train_iters
+                print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
-    if args.galvatron_profile and torch.distributed.get_rank()==0:
-        galvatron_profiler.process_profiled_data("memory")
+            iteration = start_iter
+            if args.do_train and args.train_iters > 0:
+                iteration, exception = train(start_iter, forward_step_func,
+                                model, optimizer, opt_param_scheduler,
+                                train_data_iterator, valid_data_iterator,
+                                process_non_loss_data_func, chk_manager, galvatron_profiler, cleanup_event)
 
-    ### SAILOR ###
-    # 1. Time for forward and backward
-    if args.sailor_profile:
-        time_fwd_avg = {}
-        for k, v in time_fwd.items():
-             v_metrics = v[5:]
-             time_fwd_avg[k] = round(np.average(np.asarray(v_metrics)), 6)
+            #print_datetime('after training is done')
+            # Clean the model
+            if args.compression_training:
+                model = [redundancy_clean(model[0], args.deepspeed_config_dict, mpu)]
 
-        time_bwd_avg = {}
-        for k, v in time_bwd.items():
-             v_metrics = v[5:]
-             time_bwd_avg[k] = round(np.average(np.asarray(v_metrics)), 6)
-
-        print('FORWARD: ', time_fwd_avg)
-        print('BACKWARD: ', time_bwd_avg)
-
-        mean_opt_time_sec = round(model[0].timers(STEP_MICRO_TIMER).mean()/1000, 6)
-        print(f"MEAN OPTIMIZER TIME IS {mean_opt_time_sec}")
-
-        # TODO: adjust
-        last_idx = args.num_layers + 3 # transformer start from 3 for some reason
-        if isinstance(model[0].module, LlamaModelPipe):
-             last_idx += 2
-
-        res_dict_time = {}
-        res_dict_mem = {}
-
-        res_dict_time["0"] = [time_fwd_avg["1"], time_bwd_avg["1"], mean_opt_time_sec]
-        res_dict_mem["0"] = collect_mem_info(["1"], 1, 1)
-
-        res_dict_time["1"] = [time_fwd_avg["3"], time_bwd_avg["3"], mean_opt_time_sec]
-        res_dict_mem["1"] = collect_mem_info(["3"], 1, 1)
-
-        for i in range(1, num_transformer_layers_original):
-            res_dict_time[str(i+1)] = [time_fwd_avg["4"], time_bwd_avg["4"], mean_opt_time_sec]
-            res_dict_mem[str(i+1)] = collect_mem_info(["4"], 1, 1)
-
-        if isinstance(model[0].module, LlamaModelPipe):
-            rms_norm = str(num_transformer_layers_original+1)
-            head_loss = str(num_transformer_layers_original+2)
-
-            res_dict_time[rms_norm] =  [time_fwd_avg["6"], time_bwd_avg["6"], mean_opt_time_sec]
-            res_dict_mem[rms_norm] = collect_mem_info(["6"], 1, 1)
-
-            res_dict_time[head_loss] =  [
-                time_fwd_avg["7"]+ time_fwd_avg["loss_fn"],
-                time_bwd_avg["7"] + time_bwd_avg["loss_fn"],
-                mean_opt_time_sec
-            ]
-            res_dict_mem[head_loss] = collect_mem_info(["7", "loss_fn"], 1, 1)
+            # if args.save and iteration != 0:
+            #     save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
         else:
-            head_loss = str(num_transformer_layers_original+1)
-            res_dict_time[head_loss] =  [
-               time_fwd_avg["5"]+ time_fwd_avg["loss_fn"],
-               time_bwd_avg["5"] + time_bwd_avg["loss_fn"],
-               mean_opt_time_sec
-            ]
-            res_dict_mem[head_loss] = collect_mem_info(["5", "loss_fn"], 1, 1)
+            print_rank_0('skipping training (--skip-train is on) ...')
 
+            iteration = args.iteration
 
-        res_dict = {
-            "timing": res_dict_time,
-            "memory": res_dict_mem
-        }
+        if args.galvatron_profile and torch.distributed.get_rank()==0:
+            galvatron_profiler.process_profiled_data("memory")
 
-        Path(args.results_dir).mkdir(parents=True, exist_ok=True)
-        if mpu.get_tensor_model_parallel_rank() == 0:
-             with open(f'{args.results_dir}/profile_{args.model_name}_{args.gpu_type}_{tmp_world_size}_{args.micro_batch_size}.json', 'w') as f:
-                json.dump(res_dict, f, indent=2)
+        # these are only for profiling
+        # 1. Time for forward and backward
+        if args.sailor_profile:
+            time_fwd_avg = {}
+            for k, v in time_fwd.items():
+                v_metrics = v[5:]
+                time_fwd_avg[k] = round(np.average(np.asarray(v_metrics)), 6)
 
+            time_bwd_avg = {}
+            for k, v in time_bwd.items():
+                v_metrics = v[5:]
+                time_bwd_avg[k] = round(np.average(np.asarray(v_metrics)), 6)
 
-    if args.oobleck_profile:
-        act_mem_res = {}
-        act_mem_res["0"] = alloc_res_mem["1"][0]
-        act_mem_res["1"] = alloc_res_mem["3"][0]
-        for i in range(1, num_transformer_layers_original):
-            act_mem_res[str(i+1)] = alloc_res_mem["4"][0]
-        if isinstance(model[0].module, LlamaModelPipe):
-            rms_norm = str(num_transformer_layers_original+1)
-            head_loss = str(num_transformer_layers_original+2)
-            act_mem_res[rms_norm] = alloc_res_mem["6"][0]
-            act_mem_res[head_loss] = alloc_res_mem["7"][0] + alloc_res_mem["loss_fn"][0]
-        else:
-            head_loss = str(num_transformer_layers_original+1)
-            act_mem_res[head_loss] = alloc_res_mem["5"][0] + alloc_res_mem["loss_fn"][0]
-        if mpu.get_tensor_model_parallel_rank() == 0:
-            res_file = f'{args.results_dir}/oobleck_profile_{args.model_name}_{args.gpu_type}.json'
-            if os.path.exists(res_file):
-                with open(res_file, 'r') as f:
-                    profile = json.load(f)
+            print('FORWARD: ', time_fwd_avg)
+            print('BACKWARD: ', time_bwd_avg)
+
+            mean_opt_time_sec = round(model[0].timers(STEP_MICRO_TIMER).mean()/1000, 6)
+            print(f"MEAN OPTIMIZER TIME IS {mean_opt_time_sec}")
+
+            # TODO: adjust
+            last_idx = args.num_layers + 3 # transformer start from 3 for some reason
+            if isinstance(model[0].module, LlamaModelPipe):
+                last_idx += 2
+
+            res_dict_time = {}
+            res_dict_mem = {}
+
+            if isinstance(model[0].module, GPTModelPipe):
+                time_fwd_avg["1"] = time_fwd_avg["tied_modules"]
+                time_bwd_avg["1"] = time_bwd_avg["tied_modules"]
+
+            res_dict_time["0"] = [time_fwd_avg["1"], time_bwd_avg["1"], mean_opt_time_sec]
+            if isinstance(model[0].module, GPTModelPipe):
+                res_dict_mem["0"] = collect_mem_info(["tied_modules"], 1, 1)
             else:
-                profile = {}
-            profile[str(tmp_world_size)] = act_mem_res
-            with open(res_file, 'w') as f:
-                json.dump(profile, f, indent=2)
+                res_dict_mem["0"] = collect_mem_info(["1"], 1, 1)
+
+            if isinstance(model[0].module, GPTModelPipe):
+                res_dict_time["1"] = [time_fwd_avg["2"], time_bwd_avg["2"], mean_opt_time_sec]
+                res_dict_mem["1"] = collect_mem_info(["2"], 1, 1)
+                for i in range(1, num_transformer_layers_original):
+                    res_dict_time[str(i+1)] = [time_fwd_avg["3"], time_bwd_avg["3"], mean_opt_time_sec]
+                    res_dict_mem[str(i+1)] = collect_mem_info(["3"], 1, 1)
+            else:
+                res_dict_time["1"] = [time_fwd_avg["3"], time_bwd_avg["3"], mean_opt_time_sec]
+                res_dict_mem["1"] = collect_mem_info(["3"], 1, 1)
+                for i in range(1, num_transformer_layers_original):
+                    res_dict_time[str(i+1)] = [time_fwd_avg["4"], time_bwd_avg["4"], mean_opt_time_sec]
+                    res_dict_mem[str(i+1)] = collect_mem_info(["4"], 1, 1)
+
+            if isinstance(model[0].module, LlamaModelPipe):
+                rms_norm = str(num_transformer_layers_original+1)
+                head_loss = str(num_transformer_layers_original+2)
+
+                res_dict_time[rms_norm] =  [time_fwd_avg["6"], time_bwd_avg["6"], mean_opt_time_sec]
+                res_dict_mem[rms_norm] = collect_mem_info(["6"], 1, 1)
+
+                res_dict_time[head_loss] =  [
+                    time_fwd_avg["7"]+ time_fwd_avg["loss_fn"],
+                    time_bwd_avg["7"] + time_bwd_avg["loss_fn"],
+                    mean_opt_time_sec
+                ]
+                res_dict_mem[head_loss] = collect_mem_info(["7", "loss_fn"], 1, 1)
+            elif isinstance(model[0].module, GPTModelPipe):
+                head_loss = str(num_transformer_layers_original+1)
+                res_dict_time[head_loss] =  [
+                time_fwd_avg["4"]+ time_fwd_avg["loss_fn"],
+                time_bwd_avg["4"] + time_bwd_avg["loss_fn"],
+                mean_opt_time_sec
+                ]
+                res_dict_mem[head_loss] = collect_mem_info(["4", "loss_fn"], 1, 1)
+            else:
+                head_loss = str(num_transformer_layers_original+1)
+                res_dict_time[head_loss] =  [
+                time_fwd_avg["5"]+ time_fwd_avg["loss_fn"],
+                time_bwd_avg["5"] + time_bwd_avg["loss_fn"],
+                mean_opt_time_sec
+                ]
+                res_dict_mem[head_loss] = collect_mem_info(["5", "loss_fn"], 1, 1)
 
 
-    # print_memory = int(os.getenv("PRINT_MEMORY", 0))
-    # if print_memory:
-    #     # device_id = torch.cuda.current_device()
-    #     # tp = mpu.get_tensor_model_parallel_rank()
-    #     # dp = mpu.get_data_parallel_rank()
-    #     # pp = mpu.get_pipeline_model_parallel_rank()
-    #     # source = f"memory_log_{device_id}"
-    #     # dest = f"memory_log_{dp}_{pp}_{tp}"
-    #     # os.system(f"mv {source} {dest}")
+            res_dict = {
+                "timing": res_dict_time,
+                "memory": res_dict_mem
+            }
 
-    #     Path(args.results_dir).mkdir(parents=True, exist_ok=True)
-    #     if mpu.get_tensor_model_parallel_rank() == 0:
-    #          with open(f'{args.results_dir}/profile_{args.model_name}_{args.gpu_type}_{tmp_world_size}_{args.micro_batch_size}.json', 'w') as f:
-    #             json.dump(res_dict, f, indent=2)
+            Path(args.results_dir).mkdir(parents=True, exist_ok=True)
+            if mpu.get_tensor_model_parallel_rank() == 0:
+                with open(f'{args.results_dir}/profile_{args.model_name}_{args.gpu_type}_{tmp_world_size}_{args.micro_batch_size}.json', 'w') as f:
+                    json.dump(res_dict, f, indent=2)
+
+
+        if args.oobleck_profile:
+            act_mem_res = {}
+            act_mem_res["0"] = alloc_res_mem["1"][0]
+            act_mem_res["1"] = alloc_res_mem["3"][0]
+            for i in range(1, num_transformer_layers_original):
+                act_mem_res[str(i+1)] = alloc_res_mem["4"][0]
+            if isinstance(model[0].module, LlamaModelPipe):
+                rms_norm = str(num_transformer_layers_original+1)
+                head_loss = str(num_transformer_layers_original+2)
+                act_mem_res[rms_norm] = alloc_res_mem["6"][0]
+                act_mem_res[head_loss] = alloc_res_mem["7"][0] + alloc_res_mem["loss_fn"][0]
+            else:
+                head_loss = str(num_transformer_layers_original+1)
+                act_mem_res[head_loss] = alloc_res_mem["5"][0] + alloc_res_mem["loss_fn"][0]
+            if mpu.get_tensor_model_parallel_rank() == 0:
+                res_file = f'{args.results_dir}/oobleck_profile_{args.model_name}_{args.gpu_type}.json'
+                if os.path.exists(res_file):
+                    with open(res_file, 'r') as f:
+                        profile = json.load(f)
+                else:
+                    profile = {}
+                profile[str(tmp_world_size)] = act_mem_res
+                with open(res_file, 'w') as f:
+                    json.dump(profile, f, indent=2)
+
+        if (cleanup_event is None) or (not cleanup_event.is_set() and not exception):
+            print(f"Training done!")
+            if chk_manager:
+                chk_manager.kill_checkpoint()
+
+            print_memory = int(os.getenv("PRINT_MEMORY", 0))
+            if print_memory:
+                # device_id = torch.cuda.current_device()
+                # tp = mpu.get_tensor_model_parallel_rank()
+                # dp = mpu.get_data_parallel_rank()
+                # pp = mpu.get_pipeline_model_parallel_rank()
+                # source = f"memory_log_{device_id}"
+                # dest = f"memory_log_{dp}_{pp}_{tp}"
+                # os.system(f"mv {source} {dest}")
+
+                Path(args.results_dir).mkdir(parents=True, exist_ok=True)
+                if mpu.get_tensor_model_parallel_rank() == 0:
+                    with open(f'{args.results_dir}/profile_{args.model_name}_{args.gpu_type}_{tmp_world_size}_{args.micro_batch_size}.json', 'w') as f:
+                        json.dump(res_dict, f, indent=2)
+            break
+        else:
+            print(f"TIME TO RESTART")
+            old_rank = torch.distributed.get_rank()
+            print(f"************************************************* RANK {old_rank}, BEFORE CLEANUP: {torch.cuda.memory.memory_allocated()}, {torch.cuda.memory.memory_reserved()}")
+
+            ############### cleanup
+            if exception:
+                print(f"WAITING FOR CLEANUP SIGNAL")
+                cleanup_event.wait()
+
+            # 1. process groups
+            destroy_megatron()
+
+            if chk_manager:
+                chk_manager.kill_checkpoint()
+            del chk_manager
+
+            # 2. model and deepspeed engine
+            model[0].destroy()
+            model[0].batch_timer = None
+            del model[0].module
+            model[0] = None
+            model = None
+            optimizer = None
+            opt_param_scheduler = None
+            del optimizer
+            del model
+            torch.cuda.empty_cache()
+            print(f"************************************************* RANK {old_rank}, AFTER PARTIAL CLEANUP: {torch.cuda.memory.memory_allocated()}, {torch.cuda.memory.memory_reserved()}")
+
+            # 3. data iterators
+
+            train_data_iterator = None
+            valid_data_iterator = None
+            test_data_iterator = None
+
+            print(f"************************************************* RANK {old_rank}, AFTER DATA CLEANUP: {torch.cuda.memory.memory_allocated()}, {torch.cuda.memory.memory_reserved()}")
+            cleanup_event.clear()
+            print(f"RANK {old_rank}, CLEANUP DONE")
+
+            restart_event.wait()
+            restart_event.clear()
+
+            # update args and reinitialize
+            all_args_copy = arg_dict['args']
+            model, optimizer, opt_param_scheduler, chk_manager, start_iter, train_data_iterator, valid_data_iterator, test_data_iterator = restart(
+                all_args_copy,
+                model_provider,
+                model_type,
+                train_valid_test_dataset_provider,
+                extra_args_provider=extra_args_provider,
+                args_defaults=args_defaults,
+                data_post_process=data_post_process,
+                external_args=external_args
+            )
 
 
 def update_train_iters(args):
@@ -632,9 +824,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Disallow training and inference with Transformer Engine
     # for non-GPT models
-    args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
-    assert args.allow_transformer_engine or args.transformer_impl == 'local', \
-        'Transformer Engine is only approved for GPT models'
+    # args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
+    # assert args.allow_transformer_engine or args.transformer_impl == 'local', \
+    #     'Transformer Engine is only approved for GPT models'
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -763,8 +955,7 @@ def load_model_weights_only(model_provider_func):
 
     print_datetime('before load checkpoint')
     if args.load is not None:
-        iteration = load_checkpoint(model, optimizer, lr_scheduler, strict=True, load_only_weights=True)
-
+        iteration = load_checkpoint_by_layer(model, optimizer, lr_scheduler, strict=True, load_only_weights=True)
     print_datetime('after load checkpoint weights')
 
     return model, optimizer, lr_scheduler
@@ -914,7 +1105,6 @@ def setup_model_and_optimizer(model_provider_func,
 
     return model, optimizer, opt_param_scheduler
 
-
 def get_opt_state(state_dict):
     num_opt_params = 0
     num_opt_bytes = 0
@@ -933,7 +1123,7 @@ def train_step(forward_step_func, data_iterator,
     args = get_args()
     timers = get_timers()
 
-    if args.deepspeed and args.ds_pipeline_enabled:
+    try:
         skipped_iter = 0
         num_zeros_in_grad = 0
         assert isinstance(model[0], deepspeed.PipelineEngine)
@@ -941,14 +1131,14 @@ def train_step(forward_step_func, data_iterator,
         torch.cuda.synchronize()
         start_step = time.time()
 
-        # print(f"RANK {torch.distributed.get_rank()}, BEFORE TRAIN BATCH, ALLOCATED MEM IS {torch.cuda.memory_allocated()/1e9} GB, RESERVED IS {torch.cuda.memory_reserved()/1e9} GB, MAX RESERVED IS {torch.cuda.max_memory_reserved()/1e9} GB")
+        print(f"RANK {torch.distributed.get_rank()}, BEFORE TRAIN BATCH")
         loss = model[0].train_batch(data_iter=data_iterator, galvatron_profiler=galvatron_profiler, iteration=iteration)
 
         torch.cuda.synchronize()
         end_step = time.time()
 
         log_cmd = f"Iteration took {end_step-start_step} sec\n"
-        print(f"******************* {log_cmd}")
+        print(f"******************* {log_cmd}", flush=True)
         print(type(model[0]))
         model[0].log_file.write(log_cmd)
 
@@ -960,116 +1150,10 @@ def train_step(forward_step_func, data_iterator,
         if additional_losses is not None:
             loss_dict.update(additional_losses)
         grad_norm = model[0].get_global_grad_norm()
-
-        return loss_dict, skipped_iter, grad_norm, num_zeros_in_grad
-
-    # Set grad to zero.
-    if not args.deepspeed:
-        if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_local_ddp:
-            for partition in model:
-                partition.zero_grad_buffer()
-        optimizer.zero_grad()
-
-    # Forward pass.
-    timers('forward-backward', log_level=1).start(
-        barrier=args.barrier_with_L1_time)
-    forward_backward_func = get_forward_backward_func()
-    if args.mos or args.kd:
-        # args.teacher_forward is used as global variable to enable kd loss
-        # calculation in forward pass. Users do not need to set it in the
-        # command line to use kd.
-        args.teacher_forward = True
-
-    # set timers to None if none of the timers in fwd_bwd are active, just to save the checks
-    if args.timing_log_level < 2:
-        config.timers = None
-
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step_func,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=get_num_microbatches(),
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False)
-
-    # reset timers if necessary
-    if config.timers is None:
-        config.timers = timers
-    timers('forward-backward').stop()
-    if args.mos or args.kd:
-        args.teacher_forward = False
-
-    # Empty unused memory.
-    if args.empty_unused_memory_level >= 1:
-        torch.cuda.empty_cache()
-
-    # Reduce gradients.
-    if not args.deepspeed:
-        optimizer.reduce_model_grads(args, timers)
-
-    # Vision gradients.
-    if args.vision_pretraining and args.vision_pretraining_type == "dino":
-        unwrapped_model = unwrap_model(model[0],
-                                       (torchDDP, LocalDDP, Float16Module))
-        unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
-
-    # Update parameters.
-    timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    if args.deepspeed:
-        increment = get_num_microbatches() * \
-                    args.micro_batch_size * \
-                    args.data_parallel_size
-        model[0].step(lr_kwargs={'increment': increment})
-        update_successful = model[0].was_step_applied()
-    else:
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
-    timers('optimizer').stop()
-
-    # Gather params.
-    if not args.deepspeed and update_successful:
-        optimizer.gather_model_params(args, timers)
-
-    # Vision momentum.
-    if args.vision_pretraining and args.vision_pretraining_type == "dino":
-        unwrapped_model = unwrap_model(model[0],
-                                       (torchDDP, LocalDDP, Float16Module))
-        unwrapped_model.update_momentum(args.curr_iteration)
-
-    # Update learning rate.
-    if args.deepspeed:
-        skipped_iter = 0
-        grad_norm = None
-        num_zeros_in_grad = None
-
-        loss_reduced = {}
-        for key in losses_reduced[0]:
-            losses_reduced_for_key = [x[key] for x in losses_reduced]
-            loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
-        return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
-    else:
-        if update_successful:
-            increment = get_num_microbatches() * \
-                        args.micro_batch_size * \
-                        args.data_parallel_size
-            opt_param_scheduler.step(increment=increment)
-            skipped_iter = 0
-        else:
-            skipped_iter = 1
-
-        # Empty unused memory.
-        if args.empty_unused_memory_level >= 2:
-            torch.cuda.empty_cache()
-
-        if mpu.is_pipeline_last_stage(ignore_virtual=True):
-            # Average loss across microbatches.
-            loss_reduced = {}
-            for key in losses_reduced[0]:
-                losses_reduced_for_key = [x[key] for x in losses_reduced]
-                loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
-            return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
-    return {}, skipped_iter, grad_norm, num_zeros_in_grad
+        return loss_dict, skipped_iter, grad_norm, num_zeros_in_grad, False
+    except RuntimeError as e:
+        print(f"-------------- GOT EXCEPTION {e}")
+        return None, None, None, None, True
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
@@ -1438,11 +1522,77 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     timers.log(['save-checkpoint'])
 
 
-def train(forward_step_func, model, optimizer, opt_param_scheduler,
+def get_latest_step_and_metadata(directory):
+    pattern = re.compile(r"^check_(\d+)$")
+    max_x = None
+    metadata=None
+
+    for filename in os.listdir(directory):
+        match = pattern.match(filename)
+        if match:
+            x = int(match.group(1))
+            try:
+                print(f"Loading: {directory}/{filename}")
+                metadata_i = torch.load(f"{directory}/{filename}")
+                if max_x is None or x > max_x:
+                    max_x = x
+                    metadata = metadata_i
+            except Exception as e:
+                print(f"Skipping {filename}, Exception is {e}")
+    return max_x, metadata
+
+def load_simple(start_layer, model, optimizer):
+    args = get_args()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    iteration, metadata = get_latest_step_and_metadata(args.load)
+    if iteration is None:
+        return 0
+    index = metadata['index']
+    model[0].global_samples = metadata['global_samples']
+    model[0].global_steps = metadata['global_steps']
+    print(f"-------------- DO LOAD, iteration is {iteration}")
+
+
+    # TODO: fix for fp16
+    for i,module in enumerate(model[0].forward_funcs):
+        key = i+start_layer
+        if not hasattr(module, 'state_dict'):
+            continue
+        if hasattr(module, 'parameters'):
+            cpu_buffer = torch.from_numpy(np.fromfile(f"{args.load}/module_{key}_{tp_rank}_index_{index}", dtype=np.float32))
+
+            idx = 0
+            # 1. load model
+            model_state_dict = module.state_dict()
+            for name, value in model_state_dict.items():
+                if torch.is_tensor(value):
+                    sz = torch.numel(value)
+                    model_state_dict[name].copy_(cpu_buffer[idx:idx+sz].view(value.size()))
+                    idx+=sz
+
+            # 2. load optimizer
+            for name, p in module.named_parameters():
+                if not ('weight' in name or 'bias' in name):
+                    continue
+                if isinstance(optimizer.state[p], dict):
+                    # TODO: generalize to other optimizers
+                    optimizer.state[p] = {}
+                    optimizer.state[p]['exp_avg'] = torch.zeros_like(p.data, memory_format=torch.preserve_format)
+                    optimizer.state[p]['exp_avg_sq'] = torch.zeros_like(p.data, memory_format=torch.preserve_format)
+                    sz = torch.numel(p.data)
+                    optimizer.state[p]['exp_avg'].copy_(cpu_buffer[idx:idx+sz].view(optimizer.state[p]['exp_avg'].size()))
+                    idx += sz
+                    optimizer.state[p]['exp_avg_sq'].copy_(cpu_buffer[idx:idx+sz].view(optimizer.state[p]['exp_avg'].size()))
+                    idx += sz
+    print(f"------------- LOAD DONE")
+    return iteration
+
+def train(start_iteration, forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
-          process_non_loss_data_func, chk_manager, galvatron_profiler=None):
+          process_non_loss_data_func, chk_manager, galvatron_profiler=None, cleanup_event=None):
     """Train the model function."""
 
+    start_train_time = time.time()
     args = get_args()
     timers = get_timers()
 
@@ -1462,7 +1612,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     total_loss_dict = {}
 
     # Iterations.
-    iteration = args.iteration
+    iteration = start_iteration
     rank = torch.distributed.get_rank()
 
     # Translate args to core configuration
@@ -1478,9 +1628,15 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         assert model[0].random_ltd_enabled()
         args.random_ltd_layer_num = model[0].random_ltd_scheduler.get_random_ltd_layer_num()
 
+    print(f"[RECONFIGURATION] Time in train, before start is {time.time()-start_train_time}")
 
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
+
+        if cleanup_event:
+            if cleanup_event.is_set():
+                print(f"[RECONFIGURATION] Time to restart!")
+                return iteration, False
 
         update_num_microbatches(args.consumed_train_samples)
         if args.deepspeed:
@@ -1499,7 +1655,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
 
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad, exception = \
             train_step(forward_step_func,
                     train_data_iterator,
                     model,
@@ -1508,6 +1664,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     config,
                     iteration,
                     galvatron_profiler)
+        if exception:
+            return iteration, True
 
         if galvatron_profiler:
             galvatron_profiler.post_profile_memory(iteration)
@@ -1572,34 +1730,31 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
 
         if args.save and args.save_interval and \
-        iteration % args.save_interval == 0:
-            if not chk_manager.initialized:
-                chk_manager.init_buffer_and_writer(model[0].state_dict(), optimizer.state_dict())
-            #print(f"FROM TRAINER - optimizer is {optimizer.state_dict()['state'][193]['exp_avg']}")
+        iteration % args.save_interval == 0 and mpu.get_data_parallel_rank()==0: # only DP rank 0 saves
+            print(f"-------------- DO SAVE global steps is {model[0].global_steps}")
+            if chk_manager:
+                if not chk_manager.initialized:
+                    chk_manager.init_buffer_and_writer(model[0].forward_funcs, optimizer)
+                    model[0].chk_manager = chk_manager
 
-            start_checkp = time.time()
+                while chk_manager.checkpoint_in_progress():
+                    continue
 
-            res_dict = get_additional_state(iteration)
-            if isinstance(model[0], deepspeed.PipelineEngine):
-                # we keep only what is useful from the deepspeed state
-                deepspeed_state = {
-                    "lr_scheduler": model[0].lr_scheduler.state_dict(),
-                    "global_samples": model[0].global_samples,
-                    "global_steps": model[0].global_steps
-                }
-                res_dict.update(deepspeed_state)
-            chk_manager.save_checkpoint("checkpoint.pt", res_dict)
-            while chk_manager.checkpoint_in_progress():
-                continue
+                res_dict = get_additional_state(iteration)
+                if isinstance(model[0], deepspeed.PipelineEngine):
+                    # we keep only what is useful from the deepspeed state
+                    deepspeed_state = {
+                        "lr_scheduler": model[0].lr_scheduler.state_dict(),
+                        "global_samples": model[0].global_samples,
+                        "global_steps": model[0].global_steps
+                    }
+                    res_dict.update(deepspeed_state)
+                chk_manager.save_checkpoint(res_dict)
 
-            #save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler)
-            end_checkp = time.time()
-            print(f"Checkpoint time was {end_checkp-start_checkp} sec")
-            saved_checkpoint = True
+                # end_checkp = time.time()
+                # print(f"Checkpoint time was {end_checkp-start_checkp} sec")
 
-        # print(f"RANK {rank}, AFTER ITERATION {iteration}, ALLOCATED MEM IS {torch.cuda.memory_allocated()/1e9} GB, RESERVED IS {torch.cuda.memory_reserved()/1e9} GB, MAX RESERVED IS {torch.cuda.max_memory_reserved()/1e9} GB")
-
-    return iteration
+    return iteration, False
 
 
 def evaluate(forward_step_func,

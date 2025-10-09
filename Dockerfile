@@ -47,6 +47,8 @@ COPY deepspeed/p2p.py /usr/local/lib/python3.10/dist-packages/deepspeed/runtime/
 COPY deepspeed/topology.py /usr/local/lib/python3.10/dist-packages/deepspeed/runtime/pipe/topology.py
 COPY deepspeed/utils.py /usr/local/lib/python3.10/dist-packages/deepspeed/runtime/
 COPY deepspeed/module.py /usr/local/lib/python3.10/dist-packages/deepspeed/runtime/pipe/module.py
+COPY deepspeed/comm.py /usr/local/lib/python3.10/dist-packages/deepspeed/comm/comm.py
+COPY deepspeed/torch.py /usr/local/lib/python3.10/dist-packages/deepspeed/comm/torch.py
 
 
 WORKDIR /root/sailor/third_party/Megatron-DeepSpeed

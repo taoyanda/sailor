@@ -33,6 +33,7 @@ def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=
 
     ds_conf["train_batch_size"] = bs
     ds_conf["train_micro_batch_size_per_gpu"] = bs
+    ds_conf["gradient_accumulation_steps"] = 1
 
     with open("ds_config.json", "w") as f:
         json.dump(ds_conf, f, indent=2)

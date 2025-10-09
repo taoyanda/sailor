@@ -157,6 +157,8 @@ def _build_train_valid_test_datasets(args, data_prefix, data_impl, splits_string
     valid_dataset = build_dataset(1, 'valid')
     test_dataset = build_dataset(2, 'test')
 
+    print(f"----------- ok with datasets")
+
     return (train_dataset, valid_dataset, test_dataset)
 
 
@@ -482,7 +484,7 @@ def _build_index_mappings(args, name, data_prefix, documents, sizes,
             print('write access to.')
             data_cache_success = False
 
-    # TODO
+    torch.distributed.barrier(group=mpu.get_tp_rank0_group()) # used to make sure data cache is built
     # counts = get_accelerator().LongTensor([data_cache_success])
     # torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
     # torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())

@@ -23,10 +23,8 @@ class SailorPlanner():
         arch = subprocess.check_output(['uname', '-m']).decode('utf-8')[:-1]
         lib_path = f"{home_dir}/sailor/sailor/Planner/sailor_planner/cpp_src"
 
-        os.system(f"rm {home_dir}/sailor/sailor/Planner/simulations/libplanner.cpython-310-{arch}-linux-gnu.so")
         os.system(f"cd {lib_path} && make clean && make libplanner.so")
-        os.system(f"cp {lib_path}/libplanner.cpython-310-{arch}-linux-gnu.so {home_dir}/sailor/sailor/Planner/simulations/")
-        import libplanner
+        import sailor.Planner.sailor_planner.cpp_src.libplanner as libplanner
 
         network_coeff_path = f"{home_dir}/sailor/sailor/providers/multizone_bandwidths_het.json"
         model_mem_info = f"{home_dir}/sailor/sailor/Planner/llm_info.json"

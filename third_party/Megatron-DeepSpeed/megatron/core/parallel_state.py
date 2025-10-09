@@ -8,6 +8,8 @@ from typing import Optional
 
 from .utils import GlobalMemoryBuffer
 
+from datetime import timedelta
+
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
@@ -67,7 +69,8 @@ _GLOBAL_MEMORY_BUFFER = None
 
 def initialize_model_parallel_from_file(
     pipeline_model_parallel_size: int,
-    config_file: str
+    config_file: str,
+    distributed_timeout_minutes: int
 ) -> None:
     """Initialize model data parallel groups from json file.
     The file is in the form:
@@ -78,6 +81,8 @@ def initialize_model_parallel_from_file(
 
     Currently, sequence parallelism is disabled in this config
     """
+
+    timeout_timedelta = timedelta(minutes=distributed_timeout_minutes)
 
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
@@ -104,6 +109,20 @@ def initialize_model_parallel_from_file(
         for k,node in enumerate(stage_config):
             tps_stage[j].add(len(node))
         tps_stage[j] = list(tps_stage[j])
+
+    print(f"------------------- CONFIG IS {config}")
+
+    # Build group with only TP_RANK=0
+    global _TP_0_GROUP
+    global _TP_0_RANKS
+    tp_ranks = []
+    for stage_config in config:
+        for stage_replica in stage_config:
+            tp_ranks.append(stage_replica[0])
+    group = torch.distributed.new_group(tp_ranks, timeout=timeout_timedelta)
+    if rank in tp_ranks:
+        _TP_0_RANKS = tp_ranks
+        _TP_0_GROUP = group
 
      # 1. Build all data-parallel groups.
     all_data_parallel_group_ranks = []
@@ -169,7 +188,7 @@ def initialize_model_parallel_from_file(
     _DATA_PARALLEL_GROUP_LIST = []
     _DATA_PARALLEL_GLOBAL_RANKS_LIST = []
     for ranks in all_data_parallel_group_ranks:
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
         if rank in ranks:
             _DATA_PARALLEL_GROUP_LIST.append(group)
             _DATA_PARALLEL_GLOBAL_RANKS_LIST.append(ranks)
@@ -185,7 +204,7 @@ def initialize_model_parallel_from_file(
     for i in range(num_sequence_parallel_groups):
         ranks = range(i * sequence_parallel_size,
                       (i + 1) * sequence_parallel_size)
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
         if rank in ranks:
             _SEQUENCE_PARALLEL_GROUP = group
 
@@ -209,7 +228,7 @@ def initialize_model_parallel_from_file(
             for r in l:
                 ranks_set.add(r)
         ranks = list(ranks_set)
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
 
@@ -221,7 +240,7 @@ def initialize_model_parallel_from_file(
     # iterate until finding rank:
     for stage_config in config:
         for ranks in stage_config:
-            group = torch.distributed.new_group(ranks)
+            group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
             if rank in ranks:
                 _TENSOR_MODEL_PARALLEL_GROUP = group
                 _TENSOR_MODEL_PARALLEL_RANKS = ranks
@@ -241,7 +260,7 @@ def initialize_model_parallel_from_file(
     _PIPELINE_MODEL_PARALLEL_GROUP_LIST = []
     _PIPELINE_GLOBAL_RANKS_LIST = []
     for ranks in all_pipeline_parallel_group_ranks:
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP_LIST.append(group)
             _PIPELINE_GLOBAL_RANKS_LIST.append(ranks)
@@ -257,13 +276,13 @@ def initialize_model_parallel_from_file(
             embedding_ranks = ranks
             position_embedding_ranks = ranks
 
-        group = torch.distributed.new_group(embedding_ranks)
+        group = torch.distributed.new_group(embedding_ranks, timeout=timeout_timedelta)
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
         if rank in ranks:
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
-        group = torch.distributed.new_group(position_embedding_ranks)
+        group = torch.distributed.new_group(position_embedding_ranks, timeout=timeout_timedelta)
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
@@ -292,6 +311,7 @@ def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     sequence_parallel_size: int = 1,
+    distributed_timeout_minutes: int = 10,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
     use_fp8: bool = False,
@@ -357,6 +377,7 @@ def initialize_model_parallel(
     ranks 8 to 15 belong to the second box.
 
     """
+    timeout_timedelta = timedelta(minutes=distributed_timeout_minutes)
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -400,6 +421,15 @@ def initialize_model_parallel(
 
     rank = torch.distributed.get_rank()
 
+    # Build group with only TP_RANK=0
+    global _TP_0_GROUP
+    global _TP_0_RANKS
+    tp_ranks = [rank for rank in range(world_size) if rank % tensor_model_parallel_size==0]
+    group = torch.distributed.new_group(tp_ranks, timeout=timeout_timedelta)
+    if rank in tp_ranks:
+        _TP_0_RANKS = tp_ranks
+        _TP_0_GROUP = group
+
     # Build the data-parallel groups.
     global _DATA_PARALLEL_GROUP_LIST
     global _DATA_PARALLEL_GROUP_GLOO
@@ -421,9 +451,9 @@ def initialize_model_parallel(
         for j in range(tp_or_sp_size):
             ranks = range(start_rank + j, end_rank, tp_or_sp_size)
             all_data_parallel_group_ranks.append(list(ranks))
-            group = torch.distributed.new_group(ranks)
+            group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
             if use_distributed_optimizer:
-                group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+                group_gloo = torch.distributed.new_group(ranks, backend="gloo") # not setting timeout here?
             else:
                 group_gloo = None
             if rank in ranks:
@@ -439,7 +469,7 @@ def initialize_model_parallel(
     for i in range(num_sequence_parallel_groups):
         ranks = range(i * sequence_parallel_size,
                       (i + 1) * sequence_parallel_size)
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
         if rank in ranks:
             _SEQUENCE_PARALLEL_GROUP = group
 
@@ -452,7 +482,7 @@ def initialize_model_parallel(
         for i in range(num_sequence_data_parallel_groups):
             ranks = range(i * sequence_data_parallel_size,
                         (i + 1) * sequence_data_parallel_size)
-            group = torch.distributed.new_group(ranks)
+            group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
             all_data_sequence_parallel_group_ranks.append(list(ranks))
             if rank in ranks:
                 _SEQUENCE_DATA_PARALLEL_GROUP = group
@@ -466,7 +496,7 @@ def initialize_model_parallel(
     model_parallel_group_ranks = all_data_sequence_parallel_group_ranks if enable_ds_sequence_parallel else all_data_parallel_group_ranks
     for i in range(num_model_parallel_groups):
         ranks = [parallel_group_ranks[i] for parallel_group_ranks in model_parallel_group_ranks]
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
 
@@ -476,7 +506,7 @@ def initialize_model_parallel(
     assert _TENSOR_MODEL_PARALLEL_GROUP is None, 'tensor model parallel group is already initialized'
     for i in range(num_tensor_model_parallel_groups):
         ranks = range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
             _TENSOR_MODEL_PARALLEL_RANKS = ranks
@@ -497,7 +527,7 @@ def initialize_model_parallel(
     _PIPELINE_GLOBAL_RANKS_LIST = []
     for i in range(num_pipeline_model_parallel_groups):
         ranks = range(i, world_size, num_pipeline_model_parallel_groups)
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP_LIST.append(group)
             _PIPELINE_GLOBAL_RANKS_LIST.append(ranks)
@@ -515,13 +545,13 @@ def initialize_model_parallel(
             embedding_ranks = ranks
             position_embedding_ranks = ranks
 
-        group = torch.distributed.new_group(embedding_ranks)
+        group = torch.distributed.new_group(embedding_ranks, timeout=timeout_timedelta)
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
         if rank in ranks:
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
-        group = torch.distributed.new_group(position_embedding_ranks)
+        group = torch.distributed.new_group(position_embedding_ranks, timeout=timeout_timedelta)
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
@@ -550,7 +580,7 @@ def initialize_model_parallel(
             start_rank = i * amax_group_size
             end_rank = (i + 1) * amax_group_size
             ranks = range(start_rank, end_rank)
-            group = torch.distributed.new_group(ranks)
+            group = torch.distributed.new_group(ranks, timeout=timeout_timedelta)
             if rank in ranks:
                 _AMAX_REDUCTION_GROUP = group
 
@@ -632,6 +662,12 @@ def get_data_parallel_group_gloo():
         'data parallel group-gloo is not initialized'
     return _DATA_PARALLEL_GROUP_GLOO
 
+
+def get_tp_rank0_group():
+    """Get the group of all workers with tp rank 0"""
+    assert _TP_0_GROUP is not None, \
+        'TP RANK 0 not initialized'
+    return _TP_0_GROUP
 
 def get_embedding_group():
     """Get the embedding group the caller rank belongs to."""
@@ -1013,3 +1049,5 @@ def destroy_model_parallel():
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
+    global _TP_0_GROUP
+    _TP_0_GROUP = None
