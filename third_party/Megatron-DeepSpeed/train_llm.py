@@ -40,6 +40,8 @@ def model_provider(pre_process=True, post_process=True, use_embedding=True, use_
     see_memory_usage(f"Before Building Model", force=True)
 
     args = get_args()
+    layers_per_stage = layers_per_stage if layers_per_stage is not None else args.layers_per_stage
+    print(f'>>> layers per stage: {layers_per_stage}')
     config = core_transformer_config_from_args(args)
     if hasattr(mpu, 'get_sequence_data_parallel_group'):
         dpg = mpu.get_sequence_data_parallel_group()
@@ -401,10 +403,18 @@ def run_megatron(all_args, cleanup_event=None, restart_event=None, arg_dict=None
              cleanup_event=cleanup_event,
              restart_event=restart_event,
              arg_dict=arg_dict)
+    
+def _add_layers_per_stage_argument(parser):
+    group = parser.add_argument_group(title='layers_per_stage')
+    group.add_argument('--layers-per-stage',
+                       type=int,
+                       nargs='+',
+                       default=None,
+                       help='Number of layers per pipeline stage. Length of the list should be equal to pipeline parallel size.')
 
 if __name__ == "__main__":
     # Parse arguments
-    args = parse_args(extra_args_provider=None, ignore_unknown_args=True)
+    args = parse_args(extra_args_provider=_add_layers_per_stage_argument, ignore_unknown_args=True)
 
     print(args)
     run_megatron(args)

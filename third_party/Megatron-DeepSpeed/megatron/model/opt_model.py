@@ -641,7 +641,7 @@ class OPTModelPipe(PipelineModule,MegatronModule):
                 self.specs.append(transpose)
 
             if layers_per_stage:
-                layers_per_stage[0]+=2 # for the embedding
+                layers_per_stage[0]+=2 # for the first stage, with extra transpose and _to_float16
 
         # TODO: what to do with that?
         # # # LNorm
@@ -697,7 +697,9 @@ class OPTModelPipe(PipelineModule,MegatronModule):
             )
 
         if layers_per_stage:
-            layers_per_stage[-1] += 1 # for the loss
+            layers_per_stage[-1] += 1 # for the LMHead
+            if args.fp16 or args.bf16:
+                layers_per_stage[-1] += 1 # for the float16_to_fp32
 
         print(f"======================= layers_per_stage is {layers_per_stage}")
 

@@ -758,7 +758,7 @@ class PipelineEngine(DeepSpeedEngine):
             else:
                 inputs = self.pipe_buffers['inputs'][buffer_id].clone()
         else:
-            full_tensor = reconstruct_tensor(self.pipe_buffers['inputs'][buffer_id], group=self.grid.get_slice_parallel_group())
+            full_tensor = reconstruct_tensor(self.pipe_buffers['inputs'][buffer_id], group=self.grid.get_slice_parallel_group(), fp16_enabled=self.fp16_enabled())
 
             full_tensor.requires_grad = True
             inputs = full_tensor
@@ -876,7 +876,7 @@ class PipelineEngine(DeepSpeedEngine):
         #self.pipe_buffers['output_tensors'][buffer_id].data = outputs[0]
         #outputs = (self.pipe_buffers['output_tensors'][buffer_id], *outputs[1:])
 
-        full_tensor = reconstruct_tensor(self.grad_layer_list, group=self.grid.get_slice_parallel_group())
+        full_tensor = reconstruct_tensor(self.grad_layer_list, group=self.grid.get_slice_parallel_group(), fp16_enabled=self.fp16_enabled())
         self.pipe_buffers['output_tensors'][buffer_id].data = full_tensor
         grad_tensors = (full_tensor,)
         outputs = (self.pipe_buffers['output_tensors'][buffer_id],)

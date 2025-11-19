@@ -1133,6 +1133,7 @@ def train_step(forward_step_func, data_iterator,
 
         print(f"RANK {torch.distributed.get_rank()}, BEFORE TRAIN BATCH")
         loss = model[0].train_batch(data_iter=data_iterator, galvatron_profiler=galvatron_profiler, iteration=iteration)
+        print(f"RANK {torch.distributed.get_rank()}, AFTER TRAIN BATCH")
 
         torch.cuda.synchronize()
         end_step = time.time()
@@ -1142,7 +1143,7 @@ def train_step(forward_step_func, data_iterator,
         print(type(model[0]))
         model[0].log_file.write(log_cmd)
 
-        get_opt_state(optimizer.state_dict())
+        # get_opt_state(optimizer.state_dict())
 
         additional_losses = model[0].get_additional_losses()
         loss_key = 'lm loss' if additional_losses is None else 'loss'  # use "lm loss" for backward compatibility

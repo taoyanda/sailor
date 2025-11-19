@@ -621,14 +621,15 @@ def partition_balanced(weights, num_parts):
     return parts
 
 
-def reconstruct_tensor(partial_tensor_list, group):
+def reconstruct_tensor(partial_tensor_list, group, fp16_enabled=False):
     meta = partial_tensor_list[0][0].to('cpu')
     tensor_shape = [x for x in meta[1:meta[0]+1]]
 
     num_el = prod(tensor_shape)
     group_size = dist.get_world_size(group=group)
 
-    flat_tensor = torch.zeros(num_el, dtype=torch.float32).cuda()
+    params_dtype = torch.float16 if fp16_enabled else torch.float32
+    flat_tensor = torch.zeros(num_el, dtype=params_dtype).cuda()
     # 2. reconstruct
 
     start_all = None
