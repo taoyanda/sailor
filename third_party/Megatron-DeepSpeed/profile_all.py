@@ -16,10 +16,13 @@ model_configs = {
     "OPT-350": ModelConfig(24, 1024, 16, 2048, "OPT"),
     "GPT-Neo-2.7": ModelConfig(32, 2560, 20, 2048, "GPT-Neo"),
     "OPT-30": ModelConfig(48, 7168, 56, 2048, "OPT"),
-    "LLAMA-3-8": ModelConfig(32, 4096, 32, 8192, "LLAMA")
+    "LLAMA-3-8": ModelConfig(32, 4096, 32, 8192, "LLAMA"),
+    "GPT.13B": ModelConfig(40, 5120, 40, 2048, "OPT"),
+    "GPT.6_7B": ModelConfig(32, 4096, 32, 2048, "OPT"),
+    "GPT.2_6B": ModelConfig(32, 2560, 32, 2048, "OPT")
 }
 
-def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=None, use_embedding=False, use_transformer=False, use_last=False):
+def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, fp16, profile=None, use_embedding=False, use_transformer=False, use_last=False):
 
     devices = list(range(tp_size*pp_size))
     devices_str = ",".join(str(x) for x in devices)
@@ -34,6 +37,18 @@ def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=
     ds_conf["train_batch_size"] = bs
     ds_conf["train_micro_batch_size_per_gpu"] = bs
     ds_conf["gradient_accumulation_steps"] = 1
+    
+    if fp16:
+        ds_conf["fp16"] = {
+            "enabled": True,
+            "auto_cast": False,
+            "loss_scale": 0,
+            "initial_scale_power": 16,
+            "loss_scale_window": 1000,
+            "hysteresis": 2,
+            "consecutive_hysteresis": False,
+            "min_loss_scale": 1
+        }
 
     with open("ds_config.json", "w") as f:
         json.dump(ds_conf, f, indent=2)
@@ -72,7 +87,7 @@ def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=
         f"--deepspeed "
         f"--deepspeed_config ds_config.json "
         f"--model-name {config.prof_id} "
-        f"--gpu-type A100 "
+        f"--gpu-type V100 "
         f"--train-iters 10 "
 	    f"--results-dir {results_dir} "
     )
@@ -96,11 +111,14 @@ def run(bs, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=
     if config.prof_id == "GPT-Neo":
         cmd += "--window_size 256"
 
+    if fp16:
+        cmd += " --fp16 "
+
     os.system(cmd)
 
-def run_all(bs_list, tp_size, pp_size, model_name, results_dir, num_prof_layers, profile=None, use_embedding=False, use_transformer=False, use_last=False):
+def run_all(bs_list, tp_size, pp_size, model_name, results_dir, num_prof_layers, fp16=False, profile=None, use_embedding=False, use_transformer=False, use_last=False):
     for bs in bs_list:
-        run(bs, tp_size,pp_size, model_name, results_dir, num_prof_layers, profile, use_embedding, use_transformer, use_last)
+        run(bs, tp_size,pp_size, model_name, results_dir, num_prof_layers, fp16, profile, use_embedding, use_transformer, use_last)
 
 
 if __name__ == "__main__":
@@ -129,6 +147,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--profile", type=str, default=None, help="Type of profiling. Can be one of: (sailor, oobleck, galvatron, varuna)"
     )
+    parser.add_argument('--fp16', action='store_true', help='Use fp16 training')
     parser.add_argument('--use-embedding', action='store_true', help='Varuna-specific. Use the embedding layer')
     parser.add_argument('--use-transformer', action='store_true', help='Varuna-specific. Use the transformer layer')
     parser.add_argument('--use-last', action='store_true', help='Varuna-specific. Use the last layer')
@@ -155,6 +174,7 @@ if __name__ == "__main__":
         args.model_name,
         args.results_dir,
         args.num_prof_layers,
+        args.fp16,
         args.profile,
         args.use_embedding,
         args.use_transformer,

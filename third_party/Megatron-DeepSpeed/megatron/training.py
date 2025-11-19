@@ -768,7 +768,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         use_last = args.use_last
 
     if args.layers_per_stage:
-        layers_per_stage = json.loads(args.layers_per_stage)
+        layers_per_stage = args.layers_per_stage
     else:
         layers_per_stage = None
 
@@ -1133,7 +1133,6 @@ def train_step(forward_step_func, data_iterator,
 
         print(f"RANK {torch.distributed.get_rank()}, BEFORE TRAIN BATCH")
         loss = model[0].train_batch(data_iter=data_iterator, galvatron_profiler=galvatron_profiler, iteration=iteration)
-        print(f"RANK {torch.distributed.get_rank()}, AFTER TRAIN BATCH")
 
         torch.cuda.synchronize()
         end_step = time.time()

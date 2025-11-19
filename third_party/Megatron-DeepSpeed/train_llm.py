@@ -411,6 +411,8 @@ def _add_layers_per_stage_argument(parser):
                        nargs='+',
                        default=None,
                        help='Number of layers per pipeline stage. Length of the list should be equal to pipeline parallel size.')
+    
+    return parser
 
 if __name__ == "__main__":
     # Parse arguments

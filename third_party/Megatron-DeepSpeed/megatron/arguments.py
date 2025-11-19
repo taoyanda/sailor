@@ -1006,7 +1006,6 @@ def _add_training_args(parser):
     group.add_argument('--use-embedding', action='store_true', help='Varuna-specific. Use the embedding layer')
     group.add_argument('--use-transformer', action='store_true', help='Varuna-specific. Use the transformer layer')
     group.add_argument('--use-last', action='store_true', help='Varuna-specific. Use the last layer')
-    group.add_argument('--layers-per-stage', type=str, required=False, default=None, help='Layer partitioning into stages')
     group.add_argument('--pccheck-threads', type=int, required=False, default=1, help='PCcheck threads')
 
     return parser
