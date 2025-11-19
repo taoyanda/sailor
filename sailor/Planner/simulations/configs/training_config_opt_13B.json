@@ -1,0 +1,14 @@
+{
+	"global_batch_size": 128,
+	"type": "gpt2",
+	"hidden_size": 5120,
+	"sequence_length": 2048,
+	"num_layers": 40,
+	"vocab_size": 50272,
+	"model": "GPT.13B",
+	"optimizer": "Adam",
+	"heads": 40,
+	"head_dim": 160,
+	"max_position_embeddings": 2048,
+	"num_all_layers": 42
+}

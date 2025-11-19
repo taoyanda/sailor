@@ -51,7 +51,7 @@ def evaluate_trace_with_mem(
     basic_cluster_config,
     training_config,
     profiles,
-    zone='europe-west4-a',
+    zone='us-central1-a',
     fp16=False,
     condense=False,
     op_simulator=False,
@@ -61,6 +61,9 @@ def evaluate_trace_with_mem(
     min_throughput=0.0,
     min_throughput_file=None
 ):
+    
+    print("-------------------- Start evaluation --------------------")
+    print(f"Using FP16: {fp16}, condense: {condense}, op_simulator: {op_simulator}")
 
     sim_result_list = []
     if op_simulator:

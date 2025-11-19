@@ -29,6 +29,9 @@ GPU_PRICES = {
         'us-central1-b': 2.859998,
         'us-central1-a': 2.859998
     },
+    'T4-16': {
+        'us-central1-a': 1,
+    },
     'GH-96': {
         'europe-west4-a': 11.06,
         'us-west1-b': 11.06,
@@ -40,6 +43,7 @@ GPU_PRICES = {
 
 GPU_MEMORY_GB = {
     'V100-16': 16,
+    'T4-16': 16,
     'A100-40': 40,
     'A100-80': 80,
     'GH-96': 96,

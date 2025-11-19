@@ -4,14 +4,20 @@
 unordered_map<string, int> GPU_MEMORY = {
     {"A100-40", 40},
     {"V100-16", 16},
-    {"GH-96", 96}
+    {"T4-16", 16},
+    {"GH-96", 96},
+    {"A100-80", 80},
+    {"V100-32", 32}
 
 };
 
 unordered_map<string, double> GPU_COST = {
     {"A100-40", 4.05},
-    {"V100-16", 2.55},
-    {"GH-96", 11.06}
+    {"V100-16", 0},
+    {"V100-32", 0},
+    {"GH-96", 11.06},
+    {"T4-16", 0},
+    {"A100-80", 0}
 };
 
 static void get_combinations(const vector<string> &elements, int k, int start, vector<string> &current_combination, vector<vector<string>> &all_combinations);
@@ -65,7 +71,8 @@ bool check_stage_fits(
     int gradients = 4;
     int comm = 4;
     int additional = 4;
-    int mf_factor = memory_multiplier_optim + model_copy + gradients + comm + additional;
+    // int mf_factor = memory_multiplier_optim + model_copy + gradients + comm + additional;
+    int mf_factor = 16;
     double megatron_mem;
     if (tmp == 1)
         megatron_mem = 2.0 * 1e9;
@@ -82,6 +89,8 @@ bool check_stage_fits(
     // );
 
     double mem_used = mf + af_stage * (num_stages - stage_idx) + megatron_mem;
+
+    // printf("Total memory used is %f GB, GPU mem is %f GB\n", mem_used /1024/1024/1024, gpu_mem_bytes /1024/1024/1024);
 
     return (mem_used <= gpu_mem_bytes);
 }
@@ -703,7 +712,8 @@ vector<pair<string, vector<string>>> get_regions_list(
             }
 
             // Check feasibility: at least one type i satisfies sum_gpus[i] >= required_per_type[i]
-            bool feasible = false;
+            // Commented to always allow a combination to be feasible and search anyway for max throughput
+            bool feasible = true; // false
             for (int i = 0; i < gpu_types; ++i)
             {
                 if (sum_gpus[i] >= required_per_type[i])
@@ -760,6 +770,51 @@ vector<pair<string, vector<string>>> get_regions_list(
     {
         selected_regions.push_back(make_pair(cand.hash_string, cand.ordering));
     }
+
+    return selected_regions;
+}
+
+vector<pair<string, vector<string>>> get_regions_list_single_region(
+    const unordered_map<string,vector<pair<string, vector<int>>>> &given_resources,
+    unordered_map<string, vector<int>> &region_gpu_count,
+    const vector<string> &regions,
+    const vector<vector<int>> &tmp_degrees
+)
+{
+    /**
+     *   Given some resources in a single region, return a list with the region if it can support the pipeline.
+     *   This is a simplified version of get_regions_list for a single-region scenario.
+     *   @param given_resources: map of type {"region" : [("zone", gpus)]}
+     *   @param region_gpu_count: map of available gpus per region
+     *   @param regions: vector of regions (should contain one for this function)
+     *   @param tmp_degrees: tensor parallelism per gpu_type and per stage of PP parallelism
+     *   @return regions: vector of (hash_string, region_list_i) elements, where region_list_i has i elements for i = 0, ..., num_regions
+     */
+    vector<pair<string, vector<string>>> selected_regions;
+
+    if (regions.empty()) {
+        return selected_regions;
+    }
+
+    int gpu_types = (int)tmp_degrees.size();
+    vector<int> required_per_type(gpu_types, 0);
+    for (int i = 0; i < gpu_types; ++i)
+    {
+        if (!tmp_degrees[i].empty())
+            required_per_type[i] = accumulate(tmp_degrees[i].begin(), tmp_degrees[i].end(), 0);
+    }
+
+    const string& region = regions[0];
+    const vector<int>& gcounts = region_gpu_count[region];
+
+    string hash_string = "_" + region;
+    for (int i = 0; i < gpu_types; ++i)
+    {
+        hash_string += "_" + to_string(i) + "-" + to_string(gcounts[i]);
+    }
+    vector<string> ordering = {region};
+    selected_regions.push_back(make_pair(hash_string, ordering));
+    
 
     return selected_regions;
 }

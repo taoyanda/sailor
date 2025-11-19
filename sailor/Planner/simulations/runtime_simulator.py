@@ -250,6 +250,15 @@ class Simulator():
         gradients = 4
         comm = 4
 
+        if self.fp16:
+            # model_multiplier = 16
+            memory_multiplier_optim = 2*2  # bytes
+            model_copy = 2 # model in fp16
+            additional_ds_copies = 2  # Deepspeed creates 2 additional copies of the model (start of the training)
+            gradients = 2 # gradients in fp16
+            comm = 2 # communicatiion 
+            
+            
         model_multiplier = memory_multiplier_optim + model_copy + gradients + comm + additional_ds_copies
         all_fit = True
 

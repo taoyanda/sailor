@@ -128,7 +128,10 @@ class SailorPlanner {
 
         unordered_map<string, double> COSTS = {
             {"A100-40", 3.74},
-            {"V100-16", 2.8},
+            {"V100-16", 0},
+            {"A100-80", 0},
+            {"V100-32", 0},
+            {"T4", 0},
             {"GH-96", 11.06}
         };
 
