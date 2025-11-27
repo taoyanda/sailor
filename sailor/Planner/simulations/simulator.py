@@ -207,7 +207,8 @@ def evaluate_trace_with_mem(
                     "search_time": search_time,
                     "oom_plans": oom_plans_case
                 }
-                break
+                # break
+                sim_result_list.append(sim_result)
 
         # no valid plan found
         if not sim_result:

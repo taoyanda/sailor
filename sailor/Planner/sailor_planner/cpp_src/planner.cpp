@@ -28,6 +28,7 @@ SailorPlanner::SailorPlanner(
     cout << communication_cost_file << endl;
 
     float_size = fp16 ? 2 : 4;
+    cout << "Float size is " << float_size << endl;
 
     std::ifstream coeffs_file(network_coeff_path, std::ifstream::binary);
     Json::Value coeffs;
@@ -154,6 +155,7 @@ void SailorPlanner::build_structs()
         }
         for (auto key : gpus->second[idx])
         {
+            cout << "GPU TYPE: " << gpu_type << ", TMP: " << key.first << endl;
             possible_tmps_per_gpu[idx].insert(possible_tmps_per_gpu[idx].begin(), key.first);
             min_tmps_per_gpu[idx] = min(min_tmps_per_gpu[idx], key.first);
         }

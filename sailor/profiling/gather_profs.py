@@ -6,6 +6,9 @@ from pathlib import Path
 import argparse
 import os
 
+MAX_VALUE = 1<<30
+parse_nan = lambda x: MAX_VALUE if str(x)=="NaN" else x
+
 def gather_profiles(profile_dir, gpu_type):
     all_profs_dict = {}
     mem_info_dict = {}
@@ -30,7 +33,7 @@ def gather_profiles(profile_dir, gpu_type):
         print(tmp, mbs)
 
         with open(file, 'r') as f:
-            profile_dict = json.load(f)
+            profile_dict = json.load(f, parse_constant=parse_nan)
 
         if (mbs=="1"):
             mem_info_dict[tmp] = profile_dict['memory']
