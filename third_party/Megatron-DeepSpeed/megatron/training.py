@@ -814,7 +814,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # for name, layer in model.named_children():
     #     print(name, sum(p.numel() for p in layer.parameters()))
 
-
+    stage_id = model._topo.get_coord(model.global_rank).pipe
+    mpu.set_pipeline_model_parallel_rank(stage_id)
+    
     if not isinstance(model, list):
         model = [model]
 
@@ -1068,7 +1070,7 @@ def setup_model_and_optimizer(model_provider_func,
             # hack to get batch_fn from pretrain_gpt.py
             model.set_batch_fn(model.module._megatron_batch_fn)
 
-            assert model.grid.get_pipe_parallel_rank() == mpu.get_pipeline_model_parallel_rank()
+            assert model.grid.get_pipe_parallel_rank() == mpu.get_pipeline_model_parallel_rank(), f"model grid pipe rank {model.grid.get_pipe_parallel_rank()} != mpu pipe rank {mpu.get_pipeline_model_parallel_rank()}"
             assert model.grid.get_slice_parallel_rank() == mpu.get_tensor_model_parallel_rank()
             assert model.grid.get_data_parallel_rank() == mpu.get_data_parallel_rank()
         model = [model]

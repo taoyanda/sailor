@@ -381,6 +381,15 @@ def git_ds_info():
         git_branch = "unknown"
     print(f'**** Git info for Megatron: git_hash={git_hash} git_branch={git_branch} ****')
 
+def _add_layers_per_stage_argument(parser):
+    group = parser.add_argument_group(title='layers_per_stage')
+    group.add_argument('--layers-per-stage',
+                       type=int,
+                       nargs='+',
+                       default=None,
+                       help='Number of layers per pipeline stage. Length of the list should be equal to pipeline parallel size.')
+    
+    return parser
 
 if __name__ == "__main__":
     git_ds_info()
@@ -388,5 +397,6 @@ if __name__ == "__main__":
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
+             extra_args_provider=_add_layers_per_stage_argument,
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
              data_post_process=data_post_process)

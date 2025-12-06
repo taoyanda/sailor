@@ -696,7 +696,7 @@ class OPTModelPipe(PipelineModule,MegatronModule):
                 num_dp=mpu.get_data_parallel_world_size()
             )
 
-        if args.fp16 or args.bf16:
+        if (args.fp16 or args.bf16) and layers_per_stage:
             layers_per_stage[-1] += 1 # for the float16_to_fp32
 
         print(f"======================= layers_per_stage is {layers_per_stage}")
